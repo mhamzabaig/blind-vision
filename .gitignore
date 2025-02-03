@@ -1,0 +1,7 @@
+myenv/
+# Ignore model files
+*.pth
+*.pt
+*.h5
+*.pb
+*.onnx
