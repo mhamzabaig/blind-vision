@@ -8,7 +8,6 @@ from fastapi.responses import FileResponse
 from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription
 from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder
 
-
 from fastapi.responses import FileResponse
 
 app = FastAPI()
