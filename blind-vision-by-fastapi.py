@@ -9,8 +9,40 @@ from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription
 from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder
 
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+# Allowed origins (update this if needed)
+origins = [
+    "http://localhost:3000",  # If running frontend locally
+    "https://f9d2-39-45-56-86.ngrok-free.app/",  # Ngrok tunnel URL
+    # "*"  # Allow all origins (not recommended for production)
+]
+
+# Add CORS middleware to allow frontend requests
+app.add_middleware(
+    # CORSMiddleware,
+    # allow_origins=origins,  # Allow only specific origins
+    # allow_credentials=True,
+    # allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
+    # allow_headers=["*"],  # Allow all headers
+
+    CORSMiddleware,
+    allow_origins=["*"],  # ✅ Allow all origins (for testing)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app = FastAPI()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+print(torch.cuda.is_available())  # Should return True
+print(torch.cuda.device_count())  # Check the number of GPUs available
+print(torch.cuda.get_device_name(0)) 
+
 
 @app.get("/favicon.ico")
 async def favicon():
@@ -18,10 +50,10 @@ async def favicon():
 
 
 # Load YOLOv5 model
-yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True).to('cuda')
 
 # Load MiDas model for depth estimation
-midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small')
+midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small').to('cuda')
 midas_transforms = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
 
 # Ensure models are in evaluation mode
@@ -41,6 +73,28 @@ async def serve_index():
 # WebRTC Peer Connection
 pcs = set()
 
+@app.post("/offer")
+async def offer(request: dict):
+    params = RTCSessionDescription(sdp=request["sdp"], type=request["type"])
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    @pc.on("track")
+    def on_track(track):
+        print(f"🔵 Video track received! {track.kind}")  # Input track is received
+
+        if track.kind == "video":
+            transformed_track = VideoTransformTrack(track)
+            pc.addTrack(transformed_track)  
+            print("🟢 Transformed video track added!")  # Ensure processed track is added
+
+    await pc.setRemoteDescription(params)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    print("🔴 Sending SDP response to client!")
+    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
 class VideoTransformTrack(VideoStreamTrack):
     def __init__(self, track):
         super().__init__()  
@@ -49,7 +103,7 @@ class VideoTransformTrack(VideoStreamTrack):
     async def recv(self):
         frame = await self.track.recv()
         img = frame.to_ndarray(format="bgr24")  # Convert frame to OpenCV format
-
+        
         # ✅ Object Detection with YOLOv5
         results = yolo_model(img)
 
@@ -64,46 +118,31 @@ class VideoTransformTrack(VideoStreamTrack):
             # ✅ Depth Estimation with MiDaS
             depth_map = estimate_depth_midas(cropped_object)
             avg_depth = np.mean(depth_map)
+            
+            status = danger_threshold(avg_depth)
+
 
             # ✅ Draw Bounding Box and Label
             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-            label_text = f'{label}: {score:.2f}, Depth: {avg_depth:.2f}m'
+            # label_text = f'{label}: \n{score:.2f}, Depth: \n{avg_depth:.2f}m, \nstatus:{status}'
+            label_text = f'{label} Depth: \n{avg_depth-7500:.2f}m, status:{status}'
             cv2.putText(img, label_text, (x_min+5, y_min+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # ✅ Convert back to Video Frame and Return
         new_frame = av.VideoFrame.from_ndarray(img, format="bgr24")
         new_frame.pts = frame.pts
         new_frame.time_base = frame.time_base
+        
         return new_frame
 
 
-@app.post("/offer")
-async def offer(request: dict):
-    params = RTCSessionDescription(sdp=request["sdp"], type=request["type"])
-    pc = RTCPeerConnection()
-    pcs.add(pc)
 
-    @pc.on("track")
-    def on_track(track):
-        print("🔵 Video track received!")  # Input track is received
-
-        if track.kind == "video":
-            transformed_track = VideoTransformTrack(track)
-            pc.addTrack(transformed_track)  
-            print("🟢 Transformed video track added!")  # Ensure processed track is added
-
-    await pc.setRemoteDescription(params)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    print("🔴 Sending SDP response to client!")
-    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
 
 
 # Depth Estimation Function
 def estimate_depth_midas(frame):
-    frame_transformed = midas_transforms(frame).to('cpu')
+    frame_transformed = midas_transforms(frame).to('cuda')
     with torch.no_grad():
         prediction = midas(frame_transformed)
         prediction = torch.nn.functional.interpolate(
@@ -112,4 +151,10 @@ def estimate_depth_midas(frame):
             mode='bicubic',
             align_corners=False,
         ).squeeze()
+        print(prediction)
     return prediction.cpu().numpy()
+
+def danger_threshold(distance: float):
+        if( distance> 100):
+            return "DangerAhead"
+        return "NoDanger"
